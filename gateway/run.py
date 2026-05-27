@@ -31,6 +31,8 @@ import json
 import logging
 import os
 import re
+from agent.context_pressure import assess_context_pressure, format_context_pressure_lines
+
 import shlex
 import sys
 import signal
@@ -4991,6 +4993,7 @@ class GatewayRunner:
                     title = (task.title if task else sub["task_id"])[:120]
                     for ev in d["events"]:
                         kind = ev.kind
+                        approval_request = False
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -5018,9 +5021,15 @@ class GatewayRunner:
                             )
                         elif kind == "blocked":
                             reason = ""
+                            hint = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                                reason_text = str(ev.payload["reason"])
+                                reason = f": {reason_text[:160]}"
+                                lowered = reason_text.strip().lower()
+                                if lowered.startswith(("review-required:", "approval-required:")):
+                                    approval_request = True
+                                    hint = "\nReply `approved` here to unblock and resume, or `declined` if changes are needed."
+                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}{hint}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -5045,16 +5054,86 @@ class GatewayRunner:
                         else:
                             continue
                         metadata: dict[str, Any] = {}
+                        approval_notify_sub: Optional[tuple[str, str, str, str, Optional[str], int]] = None
+                        send_chat_id = sub["chat_id"]
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        if (
+                            approval_request
+                            and plat == _Platform.DISCORD
+                            and (approval_channel := self._discord_approval_channel_id())
+                        ):
+                            approval_channel = str(approval_channel)
+                            is_approval_sub = (
+                                str(sub.get("chat_id") or "") == approval_channel
+                                and bool(sub.get("thread_id"))
+                            )
+                            if is_approval_sub:
+                                send_chat_id = str(sub.get("thread_id"))
+                                metadata = {"thread_id": send_chat_id}
+                            else:
+                                existing = await asyncio.to_thread(
+                                    self._kanban_find_notify_sub,
+                                    sub["task_id"],
+                                    board_slug,
+                                    "discord",
+                                    approval_channel,
+                                )
+                                if existing and existing.get("thread_id"):
+                                    # The dedicated approvals thread already has
+                                    # its own subscription and will receive this
+                                    # event, so do not duplicate the request in
+                                    # the source conversation.
+                                    continue
+                                thread_id = None
+                                create_thread = getattr(
+                                    adapter, "create_handoff_thread", None,
+                                )
+                                if callable(create_thread):
+                                    thread_name = (
+                                        f"Approval {sub['task_id']} - {title}"
+                                    )[:80]
+                                    try:
+                                        thread_id = await create_thread(
+                                            approval_channel,
+                                            thread_name,
+                                        )
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "kanban notifier: failed to create Discord approval thread for %s: %s",
+                                            sub["task_id"],
+                                            exc,
+                                        )
+                                send_chat_id = thread_id or approval_channel
+                                metadata = {"thread_id": thread_id} if thread_id else {}
+                                if thread_id:
+                                    approval_notify_sub = (
+                                        sub["task_id"],
+                                        "discord",
+                                        approval_channel,
+                                        thread_id,
+                                        sub.get("user_id"),
+                                        d["cursor"],
+                                    )
                         sub_key = (
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
                             await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                                send_chat_id, msg, metadata=metadata,
                             )
+                            if approval_notify_sub:
+                                await asyncio.to_thread(
+                                    self._kanban_add_notify_sub,
+                                    approval_notify_sub[0],
+                                    board_slug,
+                                    approval_notify_sub[1],
+                                    approval_notify_sub[2],
+                                    approval_notify_sub[3],
+                                    approval_notify_sub[4],
+                                    approval_notify_sub[5],
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -5172,6 +5251,63 @@ class GatewayRunner:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    def _kanban_find_notify_sub(
+        self,
+        task_id: str,
+        board: Optional[str],
+        platform: str,
+        chat_id: str,
+    ) -> Optional[dict]:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            for sub in _kb.list_notify_subs(conn, task_id):
+                if (
+                    str(sub.get("platform") or "").lower() == platform
+                    and str(sub.get("chat_id") or "") == str(chat_id)
+                    and sub.get("thread_id")
+                ):
+                    return sub
+            return None
+        finally:
+            conn.close()
+
+    def _kanban_add_notify_sub(
+        self,
+        task_id: str,
+        board: Optional[str],
+        platform: str,
+        chat_id: str,
+        thread_id: str,
+        user_id: Optional[str],
+        cursor: int,
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                notifier_profile=(
+                    getattr(self, "_kanban_notifier_profile", None)
+                    or self._active_profile_name()
+                ),
+            )
+            _kb.advance_notify_cursor(
+                conn,
+                task_id=task_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                new_cursor=cursor,
             )
         finally:
             conn.close()
@@ -13305,6 +13441,25 @@ class GatewayRunner:
                 lines.append("")
                 lines.extend(account_lines)
 
+            pressure = assess_context_pressure(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
+                context_length=getattr(ctx, "context_length", None),
+                context_used_tokens=getattr(ctx, "last_prompt_tokens", None),
+            )
+            pressure_lines = format_context_pressure_lines(
+                pressure,
+                markdown=True,
+                include_summary=True,
+            )
+            if pressure_lines:
+                lines.append("")
+                lines.append("🧭 **Context pressure**")
+                for line in pressure_lines:
+                    lines.append(f"  {line}")
+
             return "\n".join(lines)
 
         # No agent at all -- check session history for a rough count
@@ -13890,6 +14045,50 @@ class GatewayRunner:
             if anchor is not None:
                 metadata["telegram_reply_to_message_id"] = str(anchor)
         return metadata
+
+    def _approval_delivery_target_for_source(
+        self,
+        source,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Return where dangerous-command approval prompts should be delivered."""
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return chat_id, metadata
+
+        approval_channel = self._discord_approval_channel_id()
+
+        if not approval_channel:
+            return chat_id, metadata
+
+        clean_metadata = dict(metadata or {})
+        clean_metadata.pop("thread_id", None)
+        clean_metadata.pop("reply_to_message_id", None)
+        return str(approval_channel), clean_metadata or None
+
+    def _discord_approval_channel_id(self) -> Optional[str]:
+        """Return the configured Discord approval channel id, if any."""
+        platform_cfg = getattr(self, "config", None)
+        platform_cfg = (
+            getattr(platform_cfg, "platforms", {}).get(Platform.DISCORD)
+            if platform_cfg is not None
+            else None
+        )
+        approval_channel = None
+        extra = getattr(platform_cfg, "extra", None)
+        if isinstance(extra, dict):
+            approval_channel = (
+                extra.get("approval_channel")
+                or extra.get("approval_channel_id")
+            )
+        if not approval_channel:
+            approval_channel = (
+                os.getenv("DISCORD_APPROVAL_CHANNEL")
+                or os.getenv("DISCORD_APPROVAL_CHANNEL_ID")
+            )
+
+        approval_channel = str(approval_channel or "").strip()
+        return approval_channel or None
 
     @staticmethod
     def _reply_anchor_for_event(event: MessageEvent) -> Optional[str]:
@@ -17088,13 +17287,20 @@ class GatewayRunner:
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        _approval_chat_id, _approval_metadata = (
+                            self._approval_delivery_target_for_source(
+                                source,
+                                _status_chat_id,
+                                _status_thread_metadata,
+                            )
+                        )
                         _approval_fut = safe_schedule_threadsafe(
                             _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
+                                chat_id=_approval_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_approval_metadata,
                             ),
                             _loop_for_step,
                             logger=logger,

@@ -667,6 +667,9 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     before the unified rule kicks in. Suppresses itself when the
     unified rule is also about to fire, to avoid double-flagging.
     """
+    if _task_field(task, "status") in {"done", "archived"}:
+        return []
+
     failure_threshold = int(cfg.get(
         "failure_threshold",
         cfg.get("spawn_failure_threshold", 3),

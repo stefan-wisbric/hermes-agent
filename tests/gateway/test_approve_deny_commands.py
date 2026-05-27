@@ -78,6 +78,55 @@ def _clear_approval_state():
 
 
 # ------------------------------------------------------------------
+# Approval delivery routing
+# ------------------------------------------------------------------
+
+
+class TestApprovalDeliveryTarget:
+    def test_discord_approval_channel_overrides_source_thread(self, monkeypatch):
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    token="***",
+                    extra={"approval_channel": "approvals-channel"},
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="source-channel",
+            thread_id="source-thread",
+            user_id="u1",
+            chat_type="thread",
+        )
+
+        chat_id, metadata = runner._approval_delivery_target_for_source(
+            source,
+            "source-channel",
+            {"thread_id": "source-thread"},
+        )
+
+        assert chat_id == "approvals-channel"
+        assert metadata is None
+
+    def test_non_discord_approval_delivery_keeps_original_target(self):
+        runner = _make_runner()
+        source = _make_source()
+        original_metadata = {"thread_id": "topic-1"}
+
+        chat_id, metadata = runner._approval_delivery_target_for_source(
+            source,
+            "source-chat",
+            original_metadata,
+        )
+
+        assert chat_id == "source-chat"
+        assert metadata is original_metadata
+
+
+# ------------------------------------------------------------------
 # Blocking gateway approval infrastructure (tools/approval.py)
 # ------------------------------------------------------------------
 

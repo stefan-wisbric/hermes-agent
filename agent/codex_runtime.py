@@ -33,6 +33,7 @@ def run_codex_app_server_turn(
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
+    active_system_prompt: str = "",
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
@@ -59,6 +60,9 @@ def run_codex_app_server_turn(
             approval_callback = None
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            model=agent.model,
+            developer_instructions=active_system_prompt,
+            writable_roots=agent._codex_app_server_writable_roots(cwd),
             approval_callback=approval_callback,
         )
 
@@ -111,6 +115,12 @@ def run_codex_app_server_turn(
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
 
+    blocked_by_fallback = agent._maybe_block_kanban_external_runtime_prose(
+        final_text=turn.final_text,
+        effective_task_id=effective_task_id,
+        runtime_name="codex_app_server",
+    )
+
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented
     # in the run_conversation() pre-loop block (lines ~11793-11817) so we
@@ -135,7 +145,7 @@ def run_codex_app_server_turn(
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if not turn.interrupted and turn.error is None and not blocked_by_fallback:
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
@@ -151,6 +161,7 @@ def run_codex_app_server_turn(
     if (
         turn.final_text
         and not turn.interrupted
+        and not blocked_by_fallback
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -166,9 +177,14 @@ def run_codex_app_server_turn(
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": 1,  # one app-server "turn" maps to one logical API call
-        "completed": not turn.interrupted and turn.error is None,
-        "partial": turn.interrupted or turn.error is not None,
-        "error": turn.error,
+        "completed": (
+            not turn.interrupted and turn.error is None and not blocked_by_fallback
+        ),
+        "partial": turn.interrupted or turn.error is not None or blocked_by_fallback,
+        "error": turn.error or (
+            "external-runtime-prose fallback blocked Kanban task"
+            if blocked_by_fallback else None
+        ),
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
     }

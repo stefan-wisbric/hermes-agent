@@ -17,13 +17,17 @@ import type { DashboardTheme, ThemeTypography, ThemeLayout } from "./types";
 
 /** Default system stack — neutral, safe fallback for every platform. */
 const SYSTEM_SANS =
-  'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+  '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, system-ui, sans-serif';
 const SYSTEM_MONO =
   'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace';
+const HERMES_WEBUI_SANS =
+  `"Geist", "Geist Sans", ${SYSTEM_SANS}`;
 
 const DEFAULT_TYPOGRAPHY: ThemeTypography = {
-  fontSans: SYSTEM_SANS,
+  fontSans: HERMES_WEBUI_SANS,
   fontMono: SYSTEM_MONO,
+  fontUrl:
+    "https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&display=swap",
   baseSize: "15px",
   lineHeight: "1.55",
   letterSpacing: "0",

@@ -103,6 +103,29 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
+_REINDEXABLE_INTEGRITY_RE = re.compile(
+    r"^wrong # of entries in index (?P<index>[A-Za-z0-9_]+)$"
+)
+_MISSING_FROM_INDEX_RE = re.compile(
+    r"^row \d+ missing from index (?P<index>[A-Za-z0-9_]+)$"
+)
+_KANBAN_MANAGED_INDEXES = frozenset(
+    {
+        "idx_tasks_assignee_status",
+        "idx_tasks_status",
+        "idx_links_child",
+        "idx_links_parent",
+        "idx_comments_task",
+        "idx_events_task",
+        "idx_runs_task",
+        "idx_runs_status",
+        "idx_tasks_tenant",
+        "idx_tasks_idempotency",
+        "idx_tasks_session_id",
+        "idx_events_run",
+    }
+)
+
 # A running task's claim is valid for 15 minutes by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
 # call ``heartbeat_claim(task_id)`` periodically. In practice most kanban
@@ -1234,11 +1257,14 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     try:
         probe = _sqlite_connect(resolved)
         try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
+            rows = _integrity_check_results(probe)
+            if _repair_reindexable_integrity_errors(probe, rows):
+                return
         finally:
             probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+        if not rows or str(rows[0] or "").lower() != "ok":
+            detail = rows[0] if rows else "<no row>"
+            reason = f"integrity_check returned {detail!r}"
     except sqlite3.OperationalError:
         # Lock contention, busy, transient IO — not corruption. Let it propagate.
         raise
@@ -1248,6 +1274,39 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
+
+
+def _integrity_check_results(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute("PRAGMA integrity_check").fetchall()
+    return [str(row[0] or "") for row in rows]
+
+
+def _repair_reindexable_integrity_errors(
+    conn: sqlite3.Connection, integrity_results: list[str]
+) -> bool:
+    """Rebuild Hermes-owned indexes when integrity_check says only they are stale."""
+    if len(integrity_results) == 1 and integrity_results[0].lower() == "ok":
+        return True
+    indexes: set[str] = set()
+    for result in integrity_results:
+        if result.lower() == "ok":
+            continue
+        match = (
+            _REINDEXABLE_INTEGRITY_RE.match(result)
+            or _MISSING_FROM_INDEX_RE.match(result)
+        )
+        if not match:
+            return False
+        index_name = match.group("index")
+        if index_name not in _KANBAN_MANAGED_INDEXES:
+            return False
+        indexes.add(index_name)
+    if not indexes:
+        return False
+    for index_name in sorted(indexes):
+        conn.execute(f"REINDEX {index_name}")
+    repaired_results = _integrity_check_results(conn)
+    return len(repaired_results) == 1 and repaired_results[0].lower() == "ok"
 
 
 def connect(
