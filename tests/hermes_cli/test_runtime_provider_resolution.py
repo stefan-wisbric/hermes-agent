@@ -301,6 +301,62 @@ def test_resolve_runtime_provider_codex(monkeypatch):
     assert resolved["requested_provider"] == "openai-codex"
 
 
+def test_resolve_runtime_provider_codex_app_server_skips_hermes_oauth(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda provider: type("P", (), {"has_credentials": lambda self: False})(),
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.4-mini",
+            "openai_runtime": "codex_app_server",
+        },
+    )
+
+    def _unexpected_codex_oauth_lookup():
+        raise AssertionError("codex_app_server should not require Hermes Codex OAuth")
+
+    monkeypatch.setattr(rp, "resolve_codex_runtime_credentials", _unexpected_codex_oauth_lookup)
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_app_server"
+    assert resolved["base_url"] == rp.DEFAULT_CODEX_BASE_URL
+    assert resolved["api_key"] == ""
+    assert resolved["source"] == "codex-app-server"
+    assert resolved["requested_provider"] == "openai-codex"
+
+
+def test_resolve_runtime_provider_claude_cli_skips_anthropic_oauth(monkeypatch):
+    def _unexpected_provider_resolution(*args, **kwargs):
+        raise AssertionError("claude-cli should not resolve through provider auth")
+
+    monkeypatch.setattr(rp, "resolve_provider", _unexpected_provider_resolution)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "claude-cli",
+            "default": "claude-sonnet-4-6",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="claude-cli")
+
+    assert resolved["provider"] == "claude-cli"
+    assert resolved["api_mode"] == "claude_cli"
+    assert resolved["base_url"] == "claude-cli://local"
+    assert resolved["api_key"] == ""
+    assert resolved["source"] == "claude-cli"
+    assert resolved["requested_provider"] == "claude-cli"
+
+
 def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
     monkeypatch.setattr(

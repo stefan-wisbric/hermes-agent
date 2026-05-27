@@ -26,6 +26,7 @@ import time
 from collections import defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
+import re
 from urllib.parse import urljoin
 
 from agent.async_utils import (
@@ -97,6 +98,8 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     ),
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
+_KANBAN_APPROVAL_REPLY_RE = re.compile(r"^(?:approved|approve|yes|y|ok|okay|confirmed)[.!?\s]*$", re.IGNORECASE)
+_KANBAN_DECLINE_REPLY_RE = re.compile(r"^(?:declined|decline|deny|no|n|rejected|reject)[.!?\s]*$", re.IGNORECASE)
 
 try:
     import discord
@@ -338,6 +341,18 @@ def _clean_discord_id(entry: str) -> str:
     if entry.lower().startswith("user:"):
         entry = entry[5:]
     return entry.strip()
+
+
+def _iter_discord_config_values(raw: Any) -> list[str]:
+    """Return string-ish config values from list or comma-separated scalar."""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        return [str(part).strip() for part in raw if str(part).strip()]
+    text = str(raw).strip()
+    if not text:
+        return []
+    return [part.strip() for part in text.split(",") if part.strip()]
 
 
 def check_discord_requirements() -> bool:
@@ -6149,6 +6164,200 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("[%s] Failed to fetch channel history: %s", self.name, e)
             return ""
 
+    async def _maybe_handle_kanban_review_reply(
+        self,
+        message: DiscordMessage,
+        *,
+        thread_id: Optional[str],
+        raw_content: str,
+        normalized_content: str,
+    ) -> bool:
+        """Intercept approval/decline replies in task-notification threads.
+
+        A plain-text reply of ``approved`` or ``declined`` in a Discord thread
+        that is subscribed to a blocked kanban task becomes the human approval
+        signal. When ``approval_user_ids`` or ``approval_role_ids`` is
+        configured, the author must match one of those allowlists; otherwise
+        Discord channel/thread permissions are the approval boundary. The
+        handler records a comment on the task, unblocks it on approval, and
+        emits a confirmation message back into the same thread.
+        """
+        if not thread_id:
+            return False
+
+        content = normalized_content.strip()
+        if not content:
+            return False
+
+        decision: Optional[str]
+        if _KANBAN_APPROVAL_REPLY_RE.fullmatch(content):
+            decision = "approved"
+        elif _KANBAN_DECLINE_REPLY_RE.fullmatch(content):
+            decision = "declined"
+        else:
+            return False
+
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception as exc:  # pragma: no cover - environmental import failure
+            logger.debug("[%s] kanban approval import failed: %s", self.name, exc)
+            return False
+
+        conn = None
+        try:
+            conn = _kb.connect()
+            channel_id = str(getattr(message.channel, "id", "") or "")
+            if not channel_id:
+                return False
+            parent_channel_id = self._get_parent_channel_id(message.channel)
+            channel_ids = {channel_id}
+            if parent_channel_id:
+                channel_ids.add(str(parent_channel_id))
+
+            subs = _kb.list_notify_subs(conn)
+            matched: list[tuple[dict, Any, Optional[str]]] = []
+            for sub in subs:
+                if str(sub.get("platform", "")).lower() != "discord":
+                    continue
+                if str(sub.get("chat_id", "") or "") not in channel_ids:
+                    continue
+                if str(sub.get("thread_id") or "") != thread_id:
+                    continue
+                task_id = str(sub.get("task_id") or "")
+                if not task_id:
+                    continue
+                task = _kb.get_task(conn, task_id)
+                if not task or task.status != "blocked":
+                    continue
+
+                reason = None
+                try:
+                    events = _kb.list_events(conn, task_id)
+                except Exception:
+                    events = []
+                for ev in reversed(events):
+                    if getattr(ev, "kind", None) != "blocked":
+                        continue
+                    payload = getattr(ev, "payload", None) or {}
+                    if isinstance(payload, dict) and payload.get("reason"):
+                        reason = str(payload["reason"])
+                    break
+
+                if reason:
+                    lowered = reason.strip().lower()
+                    if not lowered.startswith(("review-required:", "approval-required:")):
+                        continue
+                matched.append((sub, task, reason))
+
+            if not matched:
+                return False
+
+            if not self._kanban_review_reply_authorized(message):
+                _, task, _reason = matched[0]
+                await self._send_with_retry(
+                    chat_id=channel_id,
+                    content=(
+                        f"⛔ {task.id} review reply was not authorized. "
+                        "Ask an approved reviewer to reply here."
+                    ),
+                    reply_to=str(message.id),
+                )
+                return True
+
+            _, task, reason = matched[0]
+            author = (
+                getattr(message.author, "display_name", None)
+                or getattr(message.author, "name", None)
+                or str(getattr(message.author, "id", "unknown"))
+            )
+            comment = f"Discord {decision} reply from {author}"
+            if reason:
+                comment += f" for {reason}"
+            _kb.add_comment(conn, task.id, author, comment)
+
+            if decision == "approved":
+                unblocked = _kb.unblock_task(conn, task.id)
+                if unblocked:
+                    ack = (
+                        f"✅ Recorded approval for {task.id}; it has been unblocked "
+                        f"and will resume automatically."
+                    )
+                else:
+                    ack = f"⚠️ Recorded approval for {task.id}, but it could not be unblocked."
+            else:
+                ack = f"❌ Recorded decline for {task.id}; it remains blocked until updated."
+
+            await self._send_with_retry(
+                chat_id=channel_id,
+                content=ack,
+                reply_to=str(message.id),
+            )
+            return True
+        except Exception as exc:
+            logger.warning("[%s] Kanban approval reply handling failed: %s", self.name, exc, exc_info=True)
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _kanban_review_reply_authorized(self, message: DiscordMessage) -> bool:
+        """Return whether a Discord review reply may approve/decline a task.
+
+        If no approval-specific allowlist is configured, Discord's own
+        channel/thread permissions are the trust boundary. Once a user or role
+        allowlist exists, fail closed unless the author matches one entry.
+        """
+        allowed_users = self._discord_approval_user_ids()
+        allowed_roles = self._discord_approval_role_ids()
+        if not allowed_users and not allowed_roles:
+            return True
+
+        author = getattr(message, "author", None)
+        if author is None:
+            return False
+
+        user_id = str(getattr(author, "id", "") or "")
+        if user_id and user_id in allowed_users:
+            return True
+
+        roles = getattr(author, "roles", None) or []
+        try:
+            author_role_ids = {str(getattr(role, "id", "") or "") for role in roles}
+        except TypeError:
+            return False
+        author_role_ids.discard("")
+        return bool(author_role_ids & allowed_roles)
+
+    def _discord_approval_user_ids(self) -> set[str]:
+        raw = None
+        if isinstance(getattr(self.config, "extra", None), dict):
+            raw = self.config.extra.get("approval_user_ids")
+        if raw is None:
+            raw = os.getenv("DISCORD_APPROVAL_USER_IDS", "")
+        return {
+            _clean_discord_id(str(part))
+            for part in _iter_discord_config_values(raw)
+            if _clean_discord_id(str(part))
+        }
+
+    def _discord_approval_role_ids(self) -> set[str]:
+        raw = None
+        if isinstance(getattr(self.config, "extra", None), dict):
+            raw = self.config.extra.get("approval_role_ids")
+        if raw is None:
+            raw = os.getenv("DISCORD_APPROVAL_ROLE_IDS", "")
+        role_ids: set[str] = set()
+        for part in _iter_discord_config_values(raw):
+            value = str(part).strip()
+            if value.startswith("<@&") and value.endswith(">"):
+                value = value[3:-1]
+            if value.lower().startswith("role:"):
+                value = value[5:]
+            value = value.strip()
+            if value:
+                role_ids.add(value)
+        return role_ids
+
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
@@ -7157,6 +7366,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+        if await self._maybe_handle_kanban_review_reply(
+            message,
+            thread_id=thread_id,
+            raw_content=raw_content,
+            normalized_content=normalized_content,
+        ):
+            return
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:

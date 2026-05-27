@@ -175,3 +175,9 @@ apps/desktop/demo/
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
 native/fts5_cjk/*.so
+# Graphify local/cache state. Keep graphify-out/graph.json and reports trackable.
+graphify-out/manifest.json
+graphify-out/cost.json
+graphify-out/.graph.tmp.json
+graphify-out/*.lock
+graphify-out/needs_update

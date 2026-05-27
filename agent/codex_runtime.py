@@ -619,6 +619,7 @@ def run_codex_app_server_turn(
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
+    active_system_prompt: str = "",
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
@@ -679,6 +680,9 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            model=agent.model,
+            developer_instructions=active_system_prompt,
+            writable_roots=agent._codex_app_server_writable_roots(cwd),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -785,6 +789,11 @@ def run_codex_app_server_turn(
                     exc_info=True,
                 )
 
+    blocked_by_fallback = agent._maybe_block_kanban_external_runtime_prose(
+        final_text=turn.final_text,
+        effective_task_id=effective_task_id,
+        runtime_name="codex_app_server",
+    )
 
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented
@@ -813,7 +822,7 @@ def run_codex_app_server_turn(
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if not turn.interrupted and turn.error is None and not blocked_by_fallback:
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
@@ -830,6 +839,7 @@ def run_codex_app_server_turn(
     if (
         turn.final_text
         and not turn.interrupted
+        and not blocked_by_fallback
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -845,15 +855,20 @@ def run_codex_app_server_turn(
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
-        "partial": turn.interrupted or turn.error is not None,
+        "completed": (
+            not turn.interrupted and turn.error is None and not blocked_by_fallback
+        ),
+        "partial": turn.interrupted or turn.error is not None or blocked_by_fallback,
         "interrupted": _user_interrupted,
         **(
             {"interrupt_message": _interrupt_message}
             if _interrupt_message
             else {}
         ),
-        "error": turn.error,
+        "error": turn.error or (
+            "external-runtime-prose fallback blocked Kanban task"
+            if blocked_by_fallback else None
+        ),
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

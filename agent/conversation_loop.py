@@ -816,6 +816,19 @@ def run_conversation(
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
+            active_system_prompt=active_system_prompt,
+            should_review_memory=_should_review_memory,
+        )
+    if agent.api_mode == "claude_cli":
+        return agent._run_claude_cli_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            current_turn_user_idx=current_turn_user_idx,
+            active_system_prompt=active_system_prompt,
+            ext_prefetch_cache=_ext_prefetch_cache,
+            plugin_user_context=_plugin_user_context,
             should_review_memory=_should_review_memory,
         )
 

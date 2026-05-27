@@ -71,6 +71,26 @@ class TestApiModeAccepted:
         agent = _make_codex_agent()
         assert agent.api_mode == "codex_app_server"
 
+    def test_codex_app_server_does_not_require_provider_api_key(self, monkeypatch):
+        def _unexpected_openai_client(**kwargs):
+            raise AssertionError("codex_app_server should not initialize an OpenAI client")
+
+        monkeypatch.setattr(run_agent, "OpenAI", _unexpected_openai_client)
+
+        agent = run_agent.AIAgent(
+            provider="openai-codex",
+            api_mode="codex_app_server",
+            model="gpt-5.4-mini",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+        assert agent.api_mode == "codex_app_server"
+        assert agent.provider == "openai-codex"
+        assert agent.api_key == ""
+        assert agent.client is None
+
 
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
@@ -377,6 +397,82 @@ class TestRunConversationCodexPath:
             agent.run_conversation("hi")
 
         assert captured["cwd"] == str(tmp_path)
+    def test_kanban_worker_text_fallback_blocks_task(
+        self, fake_session, monkeypatch
+    ):
+        """If codex_app_server returns prose without a terminal Kanban tool,
+        Hermes must block the task itself instead of letting the dispatcher
+        record a clean-exit protocol violation."""
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+        monkeypatch.setattr(
+            run_agent.AIAgent,
+            "_kanban_task_needs_terminal_transition",
+            lambda self, task_id: True,
+            raising=False,
+        )
+
+        agent = _make_codex_agent()
+        with (
+            patch.object(agent, "_spawn_background_review", return_value=None),
+            patch("run_agent.handle_function_call", return_value='{"ok": true}') as hfc,
+        ):
+            result = agent.run_conversation("work kanban task t_test_task_123")
+
+        assert result["completed"] is False
+        kanban_block_calls = [
+            c for c in hfc.call_args_list if c.args and c.args[0] == "kanban_block"
+        ]
+        assert len(kanban_block_calls) == 1
+        args = kanban_block_calls[0].args[1]
+        assert args["task_id"] == "t_test_task_123"
+        assert "external-runtime-prose" in args["reason"]
+
+    def test_kanban_worker_adds_hermes_and_git_writable_roots(
+        self, monkeypatch, tmp_path
+    ):
+        """Scratch Kanban tasks often need to edit a repo and Hermes state.
+
+        The codex app-server sandbox must get explicit extra writable roots;
+        otherwise worker shell/file changes outside the scratch cwd are denied
+        and the task falls back to prose.
+        """
+        hermes_home = tmp_path / ".hermes"
+        git_root = tmp_path / "git"
+        workspace = hermes_home / "kanban" / "boards" / "ai-stack" / "workspaces" / "t_test"
+        for p in (hermes_home, git_root, workspace):
+            p.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        captured = {}
+        original_init = CodexAppServerSession.__init__
+
+        def capture_init(self, **kwargs):
+            captured.update(kwargs)
+            original_init(self, **kwargs)
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", capture_init)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-stub-1",
+        )
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "run_turn",
+            lambda self, user_input, **kwargs: TurnResult(final_text="OK"),
+        )
+
+        agent = _make_codex_agent()
+        agent.session_cwd = str(workspace)
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("work kanban task t_test")
+
+        assert result["completed"] is True
+        assert str(hermes_home) in captured["writable_roots"]
+        assert str(git_root) in captured["writable_roots"]
 
     def _capture_routing_agent(self, monkeypatch):
         """Build a codex agent with a CodexAppServerSession stub that captures

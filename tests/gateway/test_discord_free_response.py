@@ -1,5 +1,6 @@
 """Tests for Discord free-response defaults and mention gating."""
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -8,6 +9,7 @@ import sys
 import pytest
 
 from gateway.config import PlatformConfig
+from hermes_cli import kanban_db as kb
 
 
 def _ensure_discord_mock():
@@ -127,8 +129,8 @@ def adapter(monkeypatch):
     return adapter
 
 
-def make_message(*, channel, content: str, mentions=None, msg_type=None):
-    author = SimpleNamespace(id=42, display_name="Jezza", name="Jezza")
+def make_message(*, channel, content: str, mentions=None, msg_type=None, author=None):
+    author = author or SimpleNamespace(id=42, display_name="Jezza", name="Jezza")
     return SimpleNamespace(
         id=123,
         content=content,
@@ -686,10 +688,9 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
 
 
 
-
 @pytest.mark.asyncio
 async def test_discord_voice_linked_parent_thread_still_requires_mention(adapter, monkeypatch):
-    """Threads under a voice-linked channel should still require @mention."""
+
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
 
@@ -1407,7 +1408,178 @@ async def test_discord_dm_does_not_backfill(adapter, monkeypatch):
         event = adapter.handle_message.await_args.args[0]
         assert event.channel_context is None
 
+@pytest.mark.asyncio
+async def test_discord_kanban_review_reply_approves_and_unblocks(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
 
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="review me", assignee="worker")
+        kb.block_task(conn, task_id, reason="review-required: needs human eyes")
+        kb.add_notify_sub(conn, task_id=task_id, platform="discord", chat_id="456", thread_id="456")
+    finally:
+        conn.close()
+
+    adapter._send_with_retry = AsyncMock(return_value=None)
+    thread = FakeThread(channel_id=456, name="review thread")
+    message = make_message(channel=thread, content="approved")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+    adapter._send_with_retry.assert_awaited_once()
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        comments = kb.list_comments(conn, task_id)
+        assert comments[-1].body.startswith("Discord approved reply")
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_discord_kanban_review_reply_denies_unlisted_user(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    adapter.config.extra["approval_user_ids"] = ["99"]
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="review me", assignee="worker")
+        kb.block_task(conn, task_id, reason="review-required: needs human eyes")
+        kb.add_notify_sub(conn, task_id=task_id, platform="discord", chat_id="456", thread_id="456")
+    finally:
+        conn.close()
+
+    adapter._send_with_retry = AsyncMock(return_value=None)
+    thread = FakeThread(channel_id=456, name="review thread")
+    message = make_message(channel=thread, content="approved")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+    adapter._send_with_retry.assert_awaited_once()
+    assert "not authorized" in adapter._send_with_retry.await_args.kwargs["content"].lower()
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        comments = kb.list_comments(conn, task_id)
+        assert not any("approved reply" in c.body for c in comments)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_discord_kanban_review_reply_allows_configured_user(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    adapter.config.extra["approval_user_ids"] = ["<@42>"]
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="review me", assignee="worker")
+        kb.block_task(conn, task_id, reason="review-required: needs human eyes")
+        kb.add_notify_sub(conn, task_id=task_id, platform="discord", chat_id="456", thread_id="456")
+    finally:
+        conn.close()
+
+    adapter._send_with_retry = AsyncMock(return_value=None)
+    thread = FakeThread(channel_id=456, name="review thread")
+    message = make_message(channel=thread, content="approved")
+
+    await adapter._handle_message(message)
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_discord_kanban_review_reply_allows_configured_role(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    adapter.config.extra["approval_role_ids"] = ["7"]
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="review me", assignee="worker")
+        kb.block_task(conn, task_id, reason="review-required: needs human eyes")
+        kb.add_notify_sub(conn, task_id=task_id, platform="discord", chat_id="456", thread_id="456")
+    finally:
+        conn.close()
+
+    adapter._send_with_retry = AsyncMock(return_value=None)
+    thread = FakeThread(channel_id=456, name="review thread")
+    author = SimpleNamespace(
+        id=42,
+        display_name="Jezza",
+        name="Jezza",
+        roles=[SimpleNamespace(id=7)],
+    )
+    message = make_message(channel=thread, content="approved", author=author)
+
+    await adapter._handle_message(message)
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_discord_kanban_review_reply_matches_parent_approval_channel(
+    adapter, monkeypatch, tmp_path,
+):
+    async def run_case():
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+        kb.init_db()
+
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(conn, title="review in approvals", assignee="worker")
+            kb.block_task(conn, task_id, reason="approval-required: ship it?")
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="discord",
+                chat_id="999",
+                thread_id="456",
+            )
+        finally:
+            conn.close()
+
+        adapter._send_with_retry = AsyncMock(return_value=None)
+        parent = FakeTextChannel(channel_id=999, name="hermes-approvals")
+        thread = FakeThread(channel_id=456, name="approval thread", parent=parent)
+        message = make_message(channel=thread, content="approved")
+
+        await adapter._handle_message(message)
+
+        adapter.handle_message.assert_not_awaited()
+        adapter._send_with_retry.assert_awaited_once()
+
+        conn = kb.connect()
+        try:
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            assert task.status == "ready"
+        finally:
+            conn.close()
+
+    asyncio.run(run_case())
 @pytest.mark.asyncio
 async def test_discord_auto_thread_skips_backfill(adapter, monkeypatch):
     """Auto-created threads skip backfill — the thread is brand new with no prior context."""

@@ -92,6 +92,18 @@ except Exception:
 import threading
 import queue
 
+def assess_context_pressure(*args, **kwargs):
+    from agent.context_pressure import assess_context_pressure as _assess_context_pressure
+
+    return _assess_context_pressure(*args, **kwargs)
+
+
+def format_context_pressure_lines(*args, **kwargs):
+    from agent.context_pressure import format_context_pressure_lines as _format_context_pressure_lines
+
+    return _format_context_pressure_lines(*args, **kwargs)
+
+
 def CanonicalUsage(*args, **kwargs):
     from agent.usage_pricing import CanonicalUsage as _CanonicalUsage
 
@@ -10377,6 +10389,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print(f"  Current context:  {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")
         print(f"  Messages:         {msg_count}")
         print(f"  Compressions:     {compressions}")
+
+        pressure = assess_context_pressure(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            context_length=ctx_len,
+            context_used_tokens=last_prompt,
+        )
+        pressure_lines = format_context_pressure_lines(
+            pressure,
+            markdown=False,
+            include_summary=True,
+        )
+        if pressure_lines:
+            print()
+            print("  Context pressure")
+            print(f"  {'─' * 40}")
+            for line in pressure_lines:
+                print(f"  {line}")
 
         # Account limits -- fetched off-thread with a hard timeout so slow
         # provider APIs don't hang the prompt.

@@ -1,0 +1,67 @@
+# Keep Graphify focused on source, skills, and architecture files.
+.git/
+graphify-out/
+.DS_Store
+
+# Runtime, dependency, and cache output.
+.venv/
+venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+.pytest-cache/
+.ruff_cache/
+.mypy_cache/
+.worktrees/
+.direnv/
+.nix-stamps/
+result
+logs/
+data/
+tmp/
+temp_vision_images/
+testlogs/
+browser-use/
+agent-browser/
+mini-swe-agent/
+models-dev-upstream/
+
+# Local/private config and generated assets.
+.env
+.env.*
+cli-config.yaml
+source-data/
+images/
+skills/.hub/
+ignored/
+hermes_cli/web_dist/
+hermes_cli/tui_dist/
+hermes_cli/scripts/
+web/public/fonts/
+web/public/ds-assets/
+website/static/api/skills-index.json
+
+# Large generated/release/reference material.
+RELEASE_v*.md
+uv.lock
+optional-skills/**/references/
+optional-skills/**/assets/
+docs/superpowers/
+environments/benchmarks/evals/
+
+# Binary/heavy artifacts.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.pdf
+*.docx
+*.xlsx
+*.pptx
+*.zip
+*.tar
+*.tgz
+*.gz
+*.woff
+*.woff2

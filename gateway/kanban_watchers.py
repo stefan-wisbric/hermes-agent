@@ -346,6 +346,7 @@ class GatewayKanbanWatchersMixin:
                     )
                     for ev in d["events"]:
                         kind = ev.kind
+                        approval_request = False
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -375,9 +376,15 @@ class GatewayKanbanWatchersMixin:
                             )
                         elif kind == "blocked":
                             reason = ""
+                            hint = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                                reason_text = str(ev.payload["reason"])
+                                reason = f": {reason_text[:160]}"
+                                lowered = reason_text.strip().lower()
+                                if lowered.startswith(("review-required:", "approval-required:")):
+                                    approval_request = True
+                                    hint = "\nReply `approved` here to unblock and resume, or `declined` if changes are needed."
+                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}{hint}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -414,20 +421,79 @@ class GatewayKanbanWatchersMixin:
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
                         metadata: dict[str, Any] = {}
+                        approval_notify_sub: Optional[tuple[str, str, str, str, Optional[str], int]] = None
+                        send_chat_id = sub["chat_id"]
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        # --- Discord approval-request routing (Wisbric) ---
+                        # Route review/approval-required prompts to a dedicated
+                        # Discord approvals thread rather than the source chat.
+                        if (
+                            approval_request
+                            and plat == _Platform.DISCORD
+                            and (approval_channel := self._discord_approval_channel_id())
+                        ):
+                            approval_channel = str(approval_channel)
+                            is_approval_sub = (
+                                str(sub.get("chat_id") or "") == approval_channel
+                                and bool(sub.get("thread_id"))
+                            )
+                            if is_approval_sub:
+                                send_chat_id = str(sub.get("thread_id"))
+                                metadata = {"thread_id": send_chat_id}
+                            else:
+                                existing = await asyncio.to_thread(
+                                    self._kanban_find_notify_sub,
+                                    sub["task_id"],
+                                    board_slug,
+                                    "discord",
+                                    approval_channel,
+                                )
+                                if existing and existing.get("thread_id"):
+                                    # The dedicated approvals thread already has
+                                    # its own subscription and will receive this
+                                    # event, so do not duplicate the request in
+                                    # the source conversation.
+                                    continue
+                                thread_id = None
+                                create_thread = getattr(
+                                    adapter, "create_handoff_thread", None,
+                                )
+                                if callable(create_thread):
+                                    thread_name = (
+                                        f"Approval {sub['task_id']} - {title}"
+                                    )[:80]
+                                    try:
+                                        thread_id = await create_thread(
+                                            approval_channel,
+                                            thread_name,
+                                        )
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "kanban notifier: failed to create Discord approval thread for %s: %s",
+                                            sub["task_id"],
+                                            exc,
+                                        )
+                                send_chat_id = thread_id or approval_channel
+                                metadata = {"thread_id": thread_id} if thread_id else {}
+                                if thread_id:
+                                    approval_notify_sub = (
+                                        sub["task_id"],
+                                        "discord",
+                                        approval_channel,
+                                        thread_id,
+                                        sub.get("user_id"),
+                                        d["cursor"],
+                                    )
                         # Adapters with no push channel (the API server —
-                        # ``supports_async_delivery = False``) can NEVER
-                        # satisfy a text-send: ``send()`` always reports
-                        # SendResult(success=False) by design (see
-                        # ApiServerAdapter.send()). Treating that as a
+                        # ``supports_async_delivery = False``) can NEVER satisfy a
+                        # text-send: ``send()`` always reports
+                        # SendResult(success=False) by design. Treating that as a
                         # delivery failure would rewind/drop the subscription
-                        # forever and — because the wake dispatch below lives
-                        # in this loop's ``else`` clause — would also make the
-                        # wake-on-completion path (the actual fix for the
-                        # api_server wrong-session bug) unreachable. So for
-                        # non-push adapters, skip the doomed send attempt
-                        # entirely: there is nothing to text-notify, the
+                        # forever and — because the wake dispatch below lives in
+                        # this loop's ``else`` clause — would also make the
+                        # wake-on-completion self-post unreachable. So for
+                        # non-push adapters, skip the doomed send entirely: the
                         # creator is woken via the self-post below instead.
                         from gateway.wake import adapter_supports_push
 
@@ -438,26 +504,40 @@ class GatewayKanbanWatchersMixin:
                                 "on wake self-post instead",
                                 platform_str, sub["task_id"],
                             )
-                            # Do NOT reset the failure counter here: on this
-                            # path the wake self-post below IS the delivery,
-                            # so the counter is resolved (reset or bumped) by
-                            # the self-post outcome, not by skipping the send.
+                            # Do NOT reset the failure counter here: on this path
+                            # the wake self-post below IS the delivery, so the
+                            # counter is resolved by the self-post outcome.
                             continue
+                        sub_key = (
+                            sub["task_id"], sub["platform"],
+                            sub["chat_id"], sub.get("thread_id") or "",
+                        )
                         try:
                             _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                                send_chat_id, msg, metadata=metadata,
                             )
                             # A SendResult(success=False) without an exception
-                            # (returned by push-capable adapters on a genuine
-                            # transient failure) must count as a FAILED
-                            # delivery — otherwise the cursor advances and the
-                            # event is permanently lost. Adapters returning
-                            # None (or anything non-SendResult shaped) keep
-                            # the legacy "no exception == delivered" contract.
+                            # (push-capable adapters on a genuine transient
+                            # failure) must count as a FAILED delivery — otherwise
+                            # the cursor advances and the event is permanently
+                            # lost. Adapters returning None (or anything
+                            # non-SendResult shaped) keep the legacy
+                            # "no exception == delivered" contract.
                             if getattr(_send_res, "success", True) is False:
                                 raise RuntimeError(
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                                )
+                            if approval_notify_sub:
+                                await asyncio.to_thread(
+                                    self._kanban_add_notify_sub,
+                                    approval_notify_sub[0],
+                                    board_slug,
+                                    approval_notify_sub[1],
+                                    approval_notify_sub[2],
+                                    approval_notify_sub[3],
+                                    approval_notify_sub[4],
+                                    approval_notify_sub[5],
                                 )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
@@ -726,6 +806,63 @@ class GatewayKanbanWatchersMixin:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    def _kanban_find_notify_sub(
+        self,
+        task_id: str,
+        board: Optional[str],
+        platform: str,
+        chat_id: str,
+    ) -> Optional[dict]:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            for sub in _kb.list_notify_subs(conn, task_id):
+                if (
+                    str(sub.get("platform") or "").lower() == platform
+                    and str(sub.get("chat_id") or "") == str(chat_id)
+                    and sub.get("thread_id")
+                ):
+                    return sub
+            return None
+        finally:
+            conn.close()
+
+    def _kanban_add_notify_sub(
+        self,
+        task_id: str,
+        board: Optional[str],
+        platform: str,
+        chat_id: str,
+        thread_id: str,
+        user_id: Optional[str],
+        cursor: int,
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                notifier_profile=(
+                    getattr(self, "_kanban_notifier_profile", None)
+                    or self._active_profile_name()
+                ),
+            )
+            _kb.advance_notify_cursor(
+                conn,
+                task_id=task_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                new_cursor=cursor,
             )
         finally:
             conn.close()

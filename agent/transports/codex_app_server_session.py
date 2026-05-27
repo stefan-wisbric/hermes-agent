@@ -25,10 +25,13 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 from __future__ import annotations
 
 import logging
+import json
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
@@ -58,6 +61,14 @@ _HERMES_TO_CODEX_PERMISSION_PROFILE = {
     "unrestricted": "full-access",
     # Backstop alias used by some skills/tests.
     "yolo": "full-access",
+}
+
+_HERMES_TO_CODEX_SANDBOX_MODE = {
+    "auto": "workspace-write",
+    "approval-required": "read-only",
+    "unrestricted": "danger-full-access",
+    # Backstop alias used by some skills/tests.
+    "yolo": "danger-full-access",
 }
 
 
@@ -228,6 +239,27 @@ _OAUTH_REFRESH_FAILURE_HINTS = (
 )
 
 
+_HERMES_TOOLS_MCP_MODULE = "agent.transports.hermes_tools_mcp_server"
+
+_HERMES_TOOLS_MCP_ENV_KEYS: tuple[str, ...] = (
+    "HOME",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "HERMES_HOME",
+    "HERMES_PROFILE",
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_TENANT",
+)
+
+
 def _classify_oauth_failure(*parts: str) -> Optional[str]:
     """Return a user-friendly re-auth hint if any of the provided strings
     look like a codex OAuth/token-refresh failure; otherwise None.
@@ -249,6 +281,60 @@ def _classify_oauth_failure(*parts: str) -> Optional[str]:
                 "`/codex-runtime auto` if the issue persists.)"
             )
     return None
+
+
+def _kanban_worker_hermes_tools_mcp_args() -> list[str]:
+    """Register Hermes' MCP bridge for dispatcher-spawned Codex workers.
+
+    The persisted ``~/.codex/config.toml`` entry intentionally cannot contain
+    per-task Kanban env vars. Codex app-server may also spawn MCP servers with
+    a narrower environment than the parent process, so we inject a dynamic
+    config override for worker sessions to make ``kanban_show`` /
+    ``kanban_complete`` / ``kanban_block`` visible inside the turn.
+    """
+    if not os.getenv("HERMES_KANBAN_TASK"):
+        return []
+
+    args: list[str] = [
+        "-c",
+        f"mcp_servers.hermes-tools.command={json.dumps(sys.executable)}",
+        "-c",
+        "mcp_servers.hermes-tools.args="
+        + json.dumps(["-m", _HERMES_TOOLS_MCP_MODULE], separators=(",", ":")),
+        "-c",
+        "mcp_servers.hermes-tools.startup_timeout_sec=30.0",
+        "-c",
+        "mcp_servers.hermes-tools.tool_timeout_sec=600.0",
+    ]
+    for key, value in sorted(_hermes_tools_mcp_env().items()):
+        args.extend(
+            [
+                "-c",
+                f"mcp_servers.hermes-tools.env.{key}={json.dumps(value)}",
+            ]
+        )
+    return args
+
+
+def _hermes_tools_mcp_env() -> dict[str, str]:
+    repo_root = str(Path(__file__).resolve().parents[2])
+    existing_pythonpath = os.getenv("PYTHONPATH", "")
+    pythonpath = (
+        repo_root
+        if not existing_pythonpath
+        else f"{repo_root}{os.pathsep}{existing_pythonpath}"
+    )
+
+    env: dict[str, str] = {
+        "PYTHONPATH": pythonpath,
+        "HERMES_QUIET": "1",
+        "HERMES_REDACT_SECRETS": "true",
+    }
+    for key in _HERMES_TOOLS_MCP_ENV_KEYS:
+        value = os.getenv(key)
+        if value:
+            env[key] = value
+    return env
 
 
 @dataclass
@@ -278,6 +364,13 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        sandbox_mode: Optional[str] = None,
+        model: Optional[str] = None,
+        base_instructions: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
+        writable_roots: Optional[list[str]] = None,
+        approval_policy: Optional[Any] = None,
+        approvals_reviewer: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -292,6 +385,20 @@ class CodexAppServerSession:
                 "workspace-write",
             )
         )
+        self._sandbox_mode = (
+            sandbox_mode or _HERMES_TO_CODEX_SANDBOX_MODE.get(
+                os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
+                "workspace-write",
+            )
+        )
+        self._model = (model or "").strip()
+        self._base_instructions = (base_instructions or "").strip()
+        self._developer_instructions = (developer_instructions or "").strip()
+        self._writable_roots = [
+            str(p).strip() for p in (writable_roots or []) if str(p).strip()
+        ]
+        self._approval_policy = approval_policy
+        self._approvals_reviewer = (approvals_reviewer or "").strip()
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
@@ -320,29 +427,33 @@ class CodexAppServerSession:
             return self._thread_id
         if self._client is None:
             self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
+                codex_bin=self._codex_bin,
+                codex_home=self._codex_home,
+                extra_args=self._codex_extra_args(),
             )
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
         )
-        # Permission selection is intentionally NOT sent on thread/start.
-        # Two reasons (live-tested against codex 0.130.0):
-        #   1. `thread/start.permissions` is gated behind the experimentalApi
-        #      capability on this codex version — we'd have to opt in during
-        #      initialize and accept the unstable surface.
-        #   2. Even with experimentalApi declared and the correct shape
-        #      (`{"type": "profile", "id": "..."}`, not `{"profileId": ...}`),
-        #      codex requires a matching `[permissions]` table in
-        #      ~/.codex/config.toml or it fails the request with
-        #      'default_permissions requires a [permissions] table'.
-        # Letting codex pick its default (`:read-only` unless the user has
-        # configured otherwise in their codex config.toml) is the standard
-        # codex CLI workflow and avoids fighting codex's own validation.
-        # Users who want a write-capable profile configure it in their
-        # ~/.codex/config.toml the same way they would for any codex usage.
+        # Permission profile selection is intentionally NOT sent on
+        # thread/start. The experimental `permissions` field is stricter than
+        # the stable `sandbox` field and can require matching config.toml
+        # tables. We use the stable sandbox/model/instruction fields here and
+        # keep the old permission_profile only for logs/backward compatibility.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._sandbox_mode:
+            params["sandbox"] = self._sandbox_mode
+        if self._model:
+            params["model"] = self._model
+        if self._base_instructions:
+            params["baseInstructions"] = self._base_instructions
+        if self._developer_instructions:
+            params["developerInstructions"] = self._developer_instructions
+        if self._approval_policy is not None:
+            params["approvalPolicy"] = self._approval_policy
+        if self._approvals_reviewer:
+            params["approvalsReviewer"] = self._approvals_reviewer
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -371,6 +482,14 @@ class CodexAppServerSession:
             self._cwd,
         )
         return self._thread_id
+
+    def _codex_extra_args(self) -> list[str]:
+        args: list[str] = []
+        if self._writable_roots:
+            roots = json.dumps(self._writable_roots, separators=(",", ":"))
+            args.extend(["-c", f"sandbox_workspace_write.writable_roots={roots}"])
+        args.extend(_kanban_worker_hermes_tools_mcp_args())
+        return args
 
     def close(self) -> None:
         if self._closed:

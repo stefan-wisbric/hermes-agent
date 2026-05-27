@@ -84,6 +84,92 @@ def test_show_status_reports_nous_auth_error(monkeypatch, capsys, tmp_path):
     assert "Key exp:" in output
 
 
+def test_show_status_explains_codex_app_server_runtime(monkeypatch, capsys, tmp_path):
+    from hermes_cli import status as status_mod
+    import hermes_cli.auth as auth_mod
+    import hermes_cli.gateway as gateway_mod
+
+    monkeypatch.setattr(status_mod, "get_env_path", lambda: tmp_path / ".env", raising=False)
+    monkeypatch.setattr(status_mod, "get_hermes_home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(
+        status_mod,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "openai-codex",
+                "default": "gpt-5.4-mini",
+                "openai_runtime": "codex_app_server",
+            }
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(status_mod, "resolve_requested_provider", lambda requested=None: "openai-codex", raising=False)
+    monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "openai-codex", raising=False)
+    monkeypatch.setattr(status_mod, "provider_label", lambda provider: "OpenAI Codex", raising=False)
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(
+        auth_mod,
+        "get_codex_auth_status",
+        lambda: {
+            "logged_in": False,
+            "auth_store": str(tmp_path / "auth.json"),
+            "error": "No Codex credentials stored.",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(auth_mod, "get_qwen_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(auth_mod, "get_minimax_oauth_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda exclude_pids=None: [], raising=False)
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "OpenAI Codex  ✓ using Codex app-server runtime" in output
+    assert "Hermes auth: not logged in (not required for app-server)" in output
+    assert "not logged in (run: hermes model)" not in output
+
+
+def test_show_status_explains_claude_cli_runtime(monkeypatch, capsys, tmp_path):
+    from hermes_cli import status as status_mod
+    import hermes_cli.auth as auth_mod
+    import hermes_cli.gateway as gateway_mod
+
+    monkeypatch.setattr(status_mod, "get_env_path", lambda: tmp_path / ".env", raising=False)
+    monkeypatch.setattr(status_mod, "get_hermes_home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(
+        status_mod,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "claude-cli",
+                "default": "claude-sonnet-4-6",
+            }
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(status_mod, "resolve_requested_provider", lambda requested=None: "claude-cli", raising=False)
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(auth_mod, "get_codex_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(auth_mod, "get_qwen_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(auth_mod, "get_minimax_oauth_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda exclude_pids=None: [], raising=False)
+
+    class _ClaudeStatus:
+        returncode = 0
+        stdout = '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}'
+        stderr = ""
+
+    monkeypatch.setattr(status_mod.subprocess, "run", lambda *a, **k: _ClaudeStatus())
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "Provider:     Claude CLI" in output
+    assert "Claude CLI    ✓ logged in via Claude CLI" in output
+    assert "Plan:       max" in output
+    assert "Auth:       claude.ai" in output
+
+
 def test_show_status_reports_nous_inference_key_without_portal_login(monkeypatch, capsys, tmp_path):
     from hermes_cli import status as status_mod
     from hermes_cli.nous_account import NousPortalAccountInfo
