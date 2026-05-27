@@ -24,6 +24,10 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from agent.context_pressure import (
+    format_context_pressure_lines,
+    summarize_sessions_for_pressure,
+)
 from agent.usage_pricing import (
     CanonicalUsage,
     estimate_usage_cost,
@@ -169,6 +173,7 @@ class InsightsEngine:
                 "source_filter": source,
                 "empty": True,
                 "overview": {},
+                "context_pressure": {"aggregate": {}, "sessions": []},
                 "models": [],
                 "platforms": [],
                 "tools": [],
@@ -193,6 +198,7 @@ class InsightsEngine:
         skills = self._compute_skill_breakdown(skill_usage)
         activity = self._compute_activity_patterns(sessions)
         top_sessions = self._compute_top_sessions(sessions)
+        pressure = summarize_sessions_for_pressure(sessions)
 
         return {
             "days": days,
@@ -200,6 +206,7 @@ class InsightsEngine:
             "empty": False,
             "generated_at": time.time(),
             "overview": overview,
+            "context_pressure": pressure,
             "models": models,
             "platforms": platforms,
             "tools": tools,
@@ -1033,6 +1040,23 @@ class InsightsEngine:
                     f"  Unknown:            {unknown_sessions} session(s) "
                     f"(no pricing data)"
                 )
+
+        pressure = report.get("context_pressure", {}) or {}
+        aggregate = pressure.get("aggregate") or {}
+        if aggregate and (aggregate.get("prompt_tokens") or aggregate.get("warnings") or aggregate.get("recommendations")):
+            lines.append("  🧭 Context Pressure")
+            lines.append("  " + "─" * 56)
+            for line in format_context_pressure_lines(aggregate, markdown=False, include_summary=True):
+                lines.append(f"  {line}")
+            notable = pressure.get("sessions") or []
+            if notable:
+                lines.append(f"  Notable sessions: {len(notable)}")
+                for item in notable[:3]:
+                    sess = item.get("session", {})
+                    assessment = item.get("assessment", {})
+                    short_id = str(sess.get("id", "?"))[:16]
+                    warning = (assessment.get("warnings") or ["attention needed"])[0]
+                    lines.append(f"  • {short_id}: {warning}")
             lines.append("")
 
         # Model breakdown

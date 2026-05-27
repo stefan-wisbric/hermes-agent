@@ -5357,6 +5357,29 @@ class GatewaySlashCommandsMixin:
                 lines.append("")
                 lines.extend(credits_lines)
 
+            from agent.context_pressure import (
+                assess_context_pressure,
+                format_context_pressure_lines,
+            )
+            pressure = assess_context_pressure(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
+                context_length=getattr(ctx, "context_length", None),
+                context_used_tokens=getattr(ctx, "last_prompt_tokens", None),
+            )
+            pressure_lines = format_context_pressure_lines(
+                pressure,
+                markdown=True,
+                include_summary=True,
+            )
+            if pressure_lines:
+                lines.append("")
+                lines.append("🧭 **Context pressure**")
+                for line in pressure_lines:
+                    lines.append(f"  {line}")
+
             return "\n".join(lines)
 
         # No agent at all -- check session history for a rough count

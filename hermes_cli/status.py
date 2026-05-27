@@ -9,6 +9,8 @@ import sys
 import time
 import importlib.util
 import subprocess  # noqa: F401 — re-exported for tests that monkeypatch status.subprocess to guard against regressions
+import importlib.util
+import json
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
@@ -82,9 +84,85 @@ def _configured_model_label(config: dict) -> str:
     return model or "(not set)"
 
 
+def _codex_app_server_runtime_enabled(config: dict) -> bool:
+    """Return True when OpenAI/Codex turns are routed through Codex CLI."""
+    model_cfg = config.get("model")
+    if not isinstance(model_cfg, dict):
+        return False
+    return str(model_cfg.get("openai_runtime") or "").strip().lower() == "codex_app_server"
+
+
+def _claude_cli_runtime_enabled(config: dict) -> bool:
+    """Return True when Claude turns are routed through Claude Code CLI."""
+    model_cfg = config.get("model")
+    if not isinstance(model_cfg, dict):
+        return False
+    provider = str(model_cfg.get("provider") or "").strip().lower()
+    if provider in {"claude-cli", "claude_cli", "claude-code", "claude-code-cli", "anthropic-cli"}:
+        return True
+    runtime = str(model_cfg.get("claude_runtime") or "").strip().lower()
+    return provider == "anthropic" and runtime in {"cli", "claude_cli", "claude-cli"}
+
+
+def _get_claude_cli_auth_status() -> dict:
+    try:
+        result = subprocess.run(
+            ["claude", "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        return {"logged_in": False, "error": str(exc)}
+
+    output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+    if result.returncode != 0:
+        return {"logged_in": False, "error": output or f"claude exited {result.returncode}"}
+
+    try:
+        parsed = json.loads(output)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        return {
+            "logged_in": bool(parsed.get("loggedIn") or parsed.get("logged_in")),
+            "auth_method": parsed.get("authMethod") or parsed.get("auth_method") or "",
+            "subscription": parsed.get("subscriptionType") or parsed.get("subscription") or "",
+        }
+
+    lower = output.lower()
+    logged_in = "not logged" not in lower and (
+        "logged in" in lower or "authenticated" in lower or "login successful" in lower
+    )
+    subscription = ""
+    auth_method = ""
+    for line in output.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key_lower = key.strip().lower()
+        if "subscription" in key_lower or key_lower == "plan":
+            subscription = value.strip()
+        elif key_lower in {"authmethod", "auth method", "method"}:
+            auth_method = value.strip()
+    return {
+        "logged_in": logged_in,
+        "auth_method": auth_method,
+        "subscription": subscription,
+        "raw": output,
+    }
+
+
 def _effective_provider_label() -> str:
     """Return the provider label matching current CLI runtime resolution."""
+    try:
+        if _claude_cli_runtime_enabled(load_config()):
+            return "Claude CLI"
+    except Exception:
+        pass
     requested = resolve_requested_provider()
+    if requested in {"claude-cli", "claude_cli", "claude-code", "claude-code-cli", "anthropic-cli"}:
+        return "Claude CLI"
     try:
         effective = resolve_provider(requested)
     except AuthError:
@@ -297,9 +375,17 @@ def show_status(args):
         print(f"    Error:      {nous_error}")
 
     codex_logged_in = bool(codex_status.get("logged_in"))
+    codex_app_server_enabled = _codex_app_server_runtime_enabled(config)
+    codex_ok = codex_logged_in or codex_app_server_enabled
+    if codex_app_server_enabled:
+        codex_label = "using Codex app-server runtime"
+    elif codex_logged_in:
+        codex_label = "logged in"
+    else:
+        codex_label = "not logged in (run: hermes model)"
     print(
-        f"  {'OpenAI Codex':<12}  {check_mark(codex_logged_in)} "
-        f"{'logged in' if codex_logged_in else 'not logged in (run: hermes model)'}"
+        f"  {'OpenAI Codex':<12}  {check_mark(codex_ok)} "
+        f"{codex_label}"
     )
     codex_auth_file = codex_status.get("auth_store")
     if codex_auth_file:
@@ -307,8 +393,31 @@ def show_status(args):
     codex_last_refresh = _format_iso_timestamp(codex_status.get("last_refresh"))
     if codex_status.get("last_refresh"):
         print(f"    Refreshed:  {codex_last_refresh}")
-    if codex_status.get("error") and not codex_logged_in:
+    if codex_app_server_enabled:
+        hermes_auth_label = "logged in" if codex_logged_in else "not logged in (not required for app-server)"
+        print(f"    Hermes auth: {hermes_auth_label}")
+        print("    Codex auth:  managed by Codex CLI (~/.codex/auth.json)")
+    if codex_status.get("error") and not codex_logged_in and not codex_app_server_enabled:
         print(f"    Error:      {codex_status.get('error')}")
+
+    if _claude_cli_runtime_enabled(config):
+        claude_status = _get_claude_cli_auth_status()
+        claude_logged_in = bool(claude_status.get("logged_in"))
+        claude_label = (
+            "logged in via Claude CLI"
+            if claude_logged_in
+            else "not logged in (run: claude auth login --claudeai)"
+        )
+        print(
+            f"  {'Claude CLI':<12}  {check_mark(claude_logged_in)} "
+            f"{claude_label}"
+        )
+        if claude_status.get("subscription"):
+            print(f"    Plan:       {claude_status.get('subscription')}")
+        if claude_status.get("auth_method"):
+            print(f"    Auth:       {claude_status.get('auth_method')}")
+        if claude_status.get("error") and not claude_logged_in:
+            print(f"    Error:      {claude_status.get('error')}")
 
     qwen_logged_in = bool(qwen_status.get("logged_in"))
     print(

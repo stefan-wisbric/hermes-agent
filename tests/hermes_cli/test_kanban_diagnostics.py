@@ -81,6 +81,141 @@ def _run(outcome="completed", run_id=1, error=None):
 
 
 
+
+def test_repeated_failures_escalates_to_critical():
+    task = _task(consecutive_failures=6, last_failure_error="boom")
+    diags = kd.compute_task_diagnostics(task, [], [])
+    assert diags[0].severity == "critical"
+
+
+def test_repeated_failures_below_threshold_silent():
+    task = _task(consecutive_failures=1)
+    assert kd.compute_task_diagnostics(task, [], []) == []
+
+
+def test_repeated_failures_default_matches_dispatcher_failure_limit():
+    """Default dispatcher auto-blocks at 2 failures, so diagnostics must
+    also surface at 2 instead of waiting for the stale threshold of 3.
+    """
+    task = _task(status="blocked", consecutive_failures=2,
+                 last_failure_error="elapsed 600s > limit 300s")
+    runs = [_run(outcome="timed_out", run_id=1)]
+    diags = kd.compute_task_diagnostics(task, [], runs)
+    repeated = [d for d in diags if d.kind == "repeated_failures"]
+    assert len(repeated) == 1
+    d = repeated[0]
+    assert d.data["failure_threshold"] == 2
+    assert d.data["failure_limit"] == 2
+    assert "default 5" not in d.detail
+    assert "configured for 2" in d.detail
+
+
+def test_repeated_failures_derives_threshold_from_kanban_failure_limit():
+    task = _task(status="ready", consecutive_failures=2,
+                 last_failure_error="Profile 'debugger' does not exist")
+    runs = [_run(outcome="spawn_failed", run_id=1)]
+    assert kd.compute_task_diagnostics(
+        task, [], runs, config={"failure_limit": 4}
+    ) == []
+
+    task = _task(status="blocked", consecutive_failures=4,
+                 last_failure_error="Profile 'debugger' does not exist")
+    diags = kd.compute_task_diagnostics(
+        task, [], runs, config={"failure_limit": 4}
+    )
+    repeated = [d for d in diags if d.kind == "repeated_failures"]
+    assert len(repeated) == 1
+    assert repeated[0].data["failure_threshold"] == 4
+    assert repeated[0].data["failure_limit"] == 4
+
+
+def test_repeated_failures_explicit_threshold_overrides_failure_limit():
+    task = _task(status="ready", consecutive_failures=3,
+                 last_failure_error="Profile 'debugger' does not exist")
+    runs = [_run(outcome="spawn_failed", run_id=1)]
+    diags = kd.compute_task_diagnostics(
+        task, [], runs, config={"failure_limit": 5, "failure_threshold": 3}
+    )
+    repeated = [d for d in diags if d.kind == "repeated_failures"]
+    assert len(repeated) == 1
+    assert repeated[0].data["failure_threshold"] == 3
+    assert repeated[0].data["failure_limit"] == 5
+
+
+def test_config_from_kanban_config_preserves_explicit_diagnostics_threshold():
+    cfg = kd.config_from_kanban_config({
+        "failure_limit": 5,
+        "diagnostics": {"failure_threshold": 3},
+    })
+    assert cfg["failure_threshold"] == 3
+    assert cfg["failure_limit"] == 5
+
+
+def test_repeated_crashes_counts_trailing_streak_only():
+    task = _task(status="ready", assignee="crashy")
+    runs = [
+        _run(outcome="completed", run_id=1),
+        _run(outcome="crashed", run_id=2, error="OOM"),
+        _run(outcome="crashed", run_id=3, error="OOM again"),
+    ]
+    diags = kd.compute_task_diagnostics(task, [], runs)
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.kind == "repeated_crashes"
+    # 2 consecutive crashes at the end → default threshold 2 → error severity.
+    assert d.severity == "error"
+    assert d.data["consecutive_crashes"] == 2
+
+
+def test_repeated_crashes_breaks_on_recent_success():
+    task = _task(status="ready", assignee="fixed")
+    runs = [
+        _run(outcome="crashed", run_id=1),
+        _run(outcome="crashed", run_id=2),
+        _run(outcome="completed", run_id=3),
+    ]
+    assert kd.compute_task_diagnostics(task, [], runs) == []
+
+
+def test_repeated_crashes_ignores_terminal_task_with_later_review_block():
+    task = _task(status="done", assignee="fixed")
+    runs = [
+        _run(outcome="blocked", run_id=1),
+        _run(outcome="crashed", run_id=2, error="pid not alive"),
+        _run(outcome="crashed", run_id=3, error="pid still not alive"),
+        _run(outcome="blocked", run_id=4, error=None),
+    ]
+    assert kd.compute_task_diagnostics(task, [], runs) == []
+
+
+def test_repeated_crashes_escalates_on_many_crashes():
+    task = _task(status="ready", assignee="x")
+    runs = [_run(outcome="crashed", run_id=i) for i in range(1, 6)]  # 5 in a row
+    diags = kd.compute_task_diagnostics(task, [], runs)
+    assert diags[0].severity == "critical"
+
+
+def test_failure_rules_exempt_terminal_statuses():
+    # A manual done (dashboard drag) ends no run, so the trailing crash
+    # streak survives in run history — but done means done: neither
+    # failure rule may keep flagging a terminal card.
+    runs = [_run(outcome="crashed", run_id=1), _run(outcome="crashed", run_id=2)]
+    for status in ("done", "archived"):
+        task = _task(status=status, assignee="crashy", consecutive_failures=3)
+        assert kd.compute_task_diagnostics(task, [], runs) == []
+
+
+def test_failure_rules_exempt_running_retry():
+    # Retrying a task (→ running) puts a fresh attempt in flight; its
+    # in-flight run (no outcome) doesn't break the trailing crash scan,
+    # so the past streak used to keep flagging over an active retry.
+    # A running card must clear the failure/crash banner until this
+    # attempt itself resolves.
+    runs = [_run(outcome="crashed", run_id=1), _run(outcome="crashed", run_id=2)]
+    task = _task(status="running", assignee="crashy", consecutive_failures=3)
+    assert kd.compute_task_diagnostics(task, [], runs) == []
+
+
 def test_stuck_in_blocked_fires_past_threshold():
     now = int(time.time())
     task = _task(status="blocked")

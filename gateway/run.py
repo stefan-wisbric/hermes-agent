@@ -34,6 +34,8 @@ import logging
 import os
 import queue
 import re
+from agent.context_pressure import assess_context_pressure, format_context_pressure_lines
+
 import shlex
 import site
 import sys
@@ -5881,13 +5883,23 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    # Local patch: route dangerous-command approval prompts to a
+                    # dedicated Discord approval channel when one is configured
+                    # (platform extra approval_channel / DISCORD_APPROVAL_CHANNEL).
+                    _approval_chat_id, _approval_metadata = (
+                        self._runner._approval_delivery_target_for_source(
+                            ctx.source,
+                            ctx._status_chat_id,
+                            ctx._status_thread_metadata,
+                        )
+                    )
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
+                            chat_id=_approval_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=_approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -23186,6 +23198,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # real existing threads from synthetic top-level session keys.
             metadata["message_id"] = str(reply_to_message_id)
         return metadata
+
+    def _approval_delivery_target_for_source(
+        self,
+        source,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Return where dangerous-command approval prompts should be delivered."""
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return chat_id, metadata
+
+        approval_channel = self._discord_approval_channel_id()
+
+        if not approval_channel:
+            return chat_id, metadata
+
+        clean_metadata = dict(metadata or {})
+        clean_metadata.pop("thread_id", None)
+        clean_metadata.pop("reply_to_message_id", None)
+        return str(approval_channel), clean_metadata or None
+
+    def _discord_approval_channel_id(self) -> Optional[str]:
+        """Return the configured Discord approval channel id, if any."""
+        platform_cfg = getattr(self, "config", None)
+        platform_cfg = (
+            getattr(platform_cfg, "platforms", {}).get(Platform.DISCORD)
+            if platform_cfg is not None
+            else None
+        )
+        approval_channel = None
+        extra = getattr(platform_cfg, "extra", None)
+        if isinstance(extra, dict):
+            approval_channel = (
+                extra.get("approval_channel")
+                or extra.get("approval_channel_id")
+            )
+        if not approval_channel:
+            approval_channel = (
+                os.getenv("DISCORD_APPROVAL_CHANNEL")
+                or os.getenv("DISCORD_APPROVAL_CHANNEL_ID")
+            )
+
+        approval_channel = str(approval_channel or "").strip()
+        return approval_channel or None
 
     @staticmethod
     def _is_telegram_dm_topic_target(

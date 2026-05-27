@@ -669,8 +669,11 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server", "claude_cli"}:
         agent.api_mode = api_mode
+    elif agent.provider in {"claude-cli", "claude_cli"}:
+        agent.api_mode = "claude_cli"
+        agent.provider = "claude-cli"
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"
     elif agent.provider in {"xai", "xai-oauth"}:
@@ -1202,6 +1205,32 @@ def init_agent(
         if not agent.quiet_mode:
             _gr_label = " + Guardrails" if agent._bedrock_guardrail_config else ""
             print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
+    elif agent.api_mode == "codex_app_server":
+        # Codex app-server owns provider auth and transport setup. Hermes
+        # should not require or initialize an OpenAI-wire client here.
+        agent.api_key = api_key or ""
+        if base_url:
+            agent.base_url = base_url
+        agent.client = None
+        agent._client_kwargs = {
+            "api_key": agent.api_key,
+            "base_url": agent.base_url,
+        }
+        if not agent.quiet_mode:
+            print(f"🤖 AI Agent initialized with model: {agent.model} (Codex app-server)")
+    elif agent.api_mode == "claude_cli":
+        # Claude CLI owns auth and subscription selection. Hermes should
+        # not require Anthropic API/OAuth credentials or an OpenAI client.
+        agent.api_key = api_key or ""
+        if base_url:
+            agent.base_url = base_url
+        agent.client = None
+        agent._client_kwargs = {
+            "api_key": agent.api_key,
+            "base_url": agent.base_url,
+        }
+        if not agent.quiet_mode:
+            print(f"🤖 AI Agent initialized with model: {agent.model} (Claude CLI)")
     else:
         if api_key and base_url:
             # Explicit credentials from CLI/gateway — construct directly.
