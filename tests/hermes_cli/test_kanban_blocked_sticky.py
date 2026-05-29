@@ -143,11 +143,18 @@ def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
         assert task.consecutive_failures == 1
 
 
-def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> None:
-    """The circuit-breaker emits ``gave_up`` (not ``blocked``).  Make
-    sure ``_has_sticky_block`` doesn't accidentally treat ``gave_up``
-    as sticky — otherwise we'd regress the safety net for genuinely
-    transient crashes."""
+def test_gave_up_event_makes_block_sticky(kanban_home: Path) -> None:
+    """A tripped circuit-breaker (``gave_up`` event + status='blocked')
+    must be STICKY: ``recompute_ready`` must not auto-promote it even when
+    all parents are done.
+
+    Previously ``gave_up`` auto-recovered, which turned a *deterministic*
+    failure (e.g. a worker exiting non-zero at startup because it was
+    handed a skill that is not provisioned to its profile) into an
+    infinite crash loop — every dispatch tick re-promoted and re-crashed
+    the task, defeating the failure-limit. Recovery now requires an
+    explicit ``unblock`` (which resets the failure counter and grants a
+    fresh bounded set of attempts)."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="child", parents=[parent])
@@ -165,8 +172,13 @@ def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> No
         )
         conn.commit()
 
+        # Sticky: not auto-promoted despite the parent being done.
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
+        assert promoted == 0
+        assert kb.get_task(conn, child).status == "blocked"
+
+        # Explicit unblock is the recovery path and clears the stickiness.
+        assert kb.unblock_task(conn, child)
         assert kb.get_task(conn, child).status == "ready"
 
 

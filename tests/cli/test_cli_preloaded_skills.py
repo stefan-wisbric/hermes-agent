@@ -92,7 +92,13 @@ def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
     assert cli_obj.preloaded_skills == ["hermes-agent-dev", "github-auth"]
 
 
-def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
+def test_main_skips_unknown_preloaded_skill_without_raising(monkeypatch, caplog):
+    """An unknown preloaded skill must NOT abort the worker. A hard raise
+    here turns one bad skill reference (e.g. an agent attaching a global
+    ~/.claude skill that is not provisioned to the worker profile) into a
+    deterministic startup crash that the dispatcher re-promotes into an
+    infinite loop. The unknown skill is skipped with a loud warning and
+    execution continues."""
     import cli as cli_mod
 
     monkeypatch.setattr(cli_mod, "HermesCLI", lambda **kwargs: _DummyCLI(**kwargs))
@@ -102,8 +108,17 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
         lambda skills, task_id=None: ("", [], ["missing-skill"]),
     )
 
-    with pytest.raises(ValueError, match=r"Unknown skill\(s\): missing-skill"):
-        cli_mod.main(skills="missing-skill", list_tools=True)
+    # main(list_tools=True) lists tools then sys.exit(0); the key assertion is
+    # that it reaches that clean exit instead of raising on the unknown skill.
+    with caplog.at_level("WARNING"):
+        with pytest.raises(SystemExit) as exc_info:
+            cli_mod.main(skills="missing-skill", list_tools=True)
+    assert exc_info.value.code == 0
+
+    assert any(
+        "missing-skill" in rec.getMessage() and "Skipping unknown skill" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 def test_show_banner_does_not_print_skills():
