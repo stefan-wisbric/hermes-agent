@@ -109,7 +109,13 @@ def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
     assert cli_obj.preloaded_skills == ["hermes-agent-dev", "github-auth"]
 
 
-def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
+def test_main_skips_unknown_preloaded_skill_without_raising(monkeypatch, caplog):
+    """An unknown preloaded skill must NOT abort the worker. A hard raise
+    here turns one bad skill reference (e.g. an agent attaching a global
+    ~/.claude skill that is not provisioned to the worker profile) into a
+    deterministic startup crash that the dispatcher re-promotes into an
+    infinite loop. The unknown skill is skipped with a loud warning and
+    execution continues."""
     import cli as cli_mod
 
     created = {}
