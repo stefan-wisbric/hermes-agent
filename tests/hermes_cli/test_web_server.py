@@ -2627,6 +2627,39 @@ class TestWebServerEndpoints:
         # No hardcoded telegram/discord/slack/email when they aren't configured.
         assert "telegram" not in targets
 
+    def test_get_status_ignores_stale_startup_failed_from_race_loser(self, monkeypatch):
+        import gateway.config as gateway_config
+        import hermes_cli.web_server as web_server
+
+        class _GatewayConfig:
+            def get_connected_platforms(self):
+                return []
+
+        monkeypatch.setattr(web_server, "get_running_pid", lambda: 87430)
+        monkeypatch.setattr(
+            web_server,
+            "read_runtime_status",
+            lambda: {
+                "pid": 87475,
+                "gateway_state": "startup_failed",
+                "exit_reason": "discord conflict",
+                "platforms": {
+                    "discord": {"state": "fatal", "error_message": "token already in use"},
+                },
+            },
+        )
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: _GatewayConfig())
+
+        resp = self.client.get("/api/status")
+
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["gateway_running"] is True
+        assert payload["gateway_state"] == "running"
+        assert payload["gateway_exit_reason"] is None
+        assert payload["gateway_platforms"] == {}
+
     def test_get_config_schema(self):
         resp = self.client.get("/api/config/schema")
         assert resp.status_code == 200

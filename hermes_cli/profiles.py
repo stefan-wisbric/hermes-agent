@@ -812,6 +812,37 @@ def _profile_yaml_path(profile_dir: Path) -> Path:
     return profile_dir / "profile.yaml"
 
 
+def _profile_description_from_soul(profile_dir: Path) -> str:
+    """Best-effort legacy fallback for profiles that predate profile.yaml.
+
+    Many hand-curated profiles already summarize their role in SOUL.md. Use
+    the first prose paragraph there so Kanban routing has something useful
+    instead of an empty description after an upgrade.
+    """
+    path = profile_dir / "SOUL.md"
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+    for block in re.split(r"\n\s*\n", text):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        first = lines[0]
+        if first.startswith("#") or first.endswith(":"):
+            continue
+        if any(line.startswith(("-", "*")) for line in lines):
+            continue
+        paragraph = " ".join(lines).strip()
+        if len(paragraph) < 20:
+            continue
+        return paragraph[:280].strip()
+    return ""
+
+
 def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``<profile_dir>/profile.yaml`` and return a dict.
 
@@ -822,7 +853,10 @@ def read_profile_meta(profile_dir: Path) -> dict:
     """
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
-        return {"description": "", "description_auto": False}
+        return {
+            "description": _profile_description_from_soul(profile_dir),
+            "description_auto": False,
+        }
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
@@ -831,8 +865,11 @@ def read_profile_meta(profile_dir: Path) -> dict:
         return {"description": "", "description_auto": False}
     if not isinstance(data, dict):
         return {"description": "", "description_auto": False}
+    description = str(data.get("description") or "").strip()
+    if not description:
+        description = _profile_description_from_soul(profile_dir)
     return {
-        "description": str(data.get("description") or "").strip(),
+        "description": description,
         "description_auto": bool(data.get("description_auto", False)),
     }
 

@@ -642,6 +642,45 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["telegram"]["error_code"] == "telegram_polling_conflict"
         assert payload["platforms"]["telegram"]["error_message"] == "another poller is active"
 
+    def test_write_runtime_status_does_not_clobber_live_gateway_owner(self, tmp_path, monkeypatch):
+        """A failed racing startup must not overwrite the healthy gateway status."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        owner_pid = 4242
+        (tmp_path / "gateway.pid").write_text(json.dumps({
+            "pid": owner_pid,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway", "run", "--replace"],
+            "start_time": 123,
+        }))
+        (tmp_path / "gateway_state.json").write_text(json.dumps({
+            "pid": owner_pid,
+            "kind": "hermes-gateway",
+            "gateway_state": "running",
+            "exit_reason": None,
+            "platforms": {"discord": {"state": "connected"}},
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }))
+
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: pid == owner_pid)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+        monkeypatch.setattr(status, "_looks_like_gateway_process", lambda pid: True)
+
+        status.write_runtime_status(
+            gateway_state="startup_failed",
+            exit_reason="discord conflict",
+            platform="discord",
+            platform_state="fatal",
+            error_code="discord-bot-token_lock",
+            error_message="Discord bot token already in use",
+        )
+
+        payload = status.read_runtime_status()
+        assert payload["pid"] == owner_pid
+        assert payload["gateway_state"] == "running"
+        assert payload["exit_reason"] is None
+        assert payload["platforms"]["discord"]["state"] == "connected"
+
     def test_write_runtime_status_explicit_none_clears_stale_fields(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

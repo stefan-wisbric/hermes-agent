@@ -29,6 +29,46 @@ def test_read_profile_meta_empty_when_missing(profile_env):
     assert meta == {"description": "", "description_auto": False}
 
 
+def test_read_profile_meta_falls_back_to_soul_role_paragraph(profile_env):
+    (profile_env / "SOUL.md").write_text(
+        "# Wisbric Hermes Profile: coding-agent\n\n"
+        "Karl Baseline:\n"
+        "- Be direct.\n"
+        "- Preserve this profile's role.\n\n"
+        "Implementation worker. Execute PRPs, make focused code changes, run tests, "
+        "and report proof-bearing handoffs.\n\n"
+        "Configured model target:\n"
+        "- provider: claude-cli\n",
+        encoding="utf-8",
+    )
+
+    meta = profiles_mod.read_profile_meta(profile_env)
+
+    assert meta == {
+        "description": (
+            "Implementation worker. Execute PRPs, make focused code changes, "
+            "run tests, and report proof-bearing handoffs."
+        ),
+        "description_auto": False,
+    }
+
+
+def test_read_profile_meta_profile_yaml_wins_over_soul(profile_env):
+    (profile_env / "SOUL.md").write_text(
+        "Implementation worker. Execute PRPs and run tests.",
+        encoding="utf-8",
+    )
+    profiles_mod.write_profile_meta(
+        profile_env,
+        description="curated routing description",
+        description_auto=False,
+    )
+
+    meta = profiles_mod.read_profile_meta(profile_env)
+
+    assert meta["description"] == "curated routing description"
+
+
 def test_write_and_read_profile_meta(profile_env):
     profiles_mod.write_profile_meta(
         profile_env,

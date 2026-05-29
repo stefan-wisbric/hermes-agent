@@ -3081,6 +3081,13 @@ async def get_status(profile: Optional[str] = None):
             if not gateway_running:
                 gateway_state = gateway_state if gateway_state in {"stopped", "startup_failed"} else "stopped"
                 gateway_platforms = {}
+            elif gateway_state == "startup_failed" and runtime.get("pid") != gateway_pid:
+                # A losing startup race can leave stale failure details in
+                # gateway_state.json while the real gateway keeps running. Trust
+                # the live PID signal and avoid surfacing the stale failure.
+                gateway_state = "running"
+                gateway_exit_reason = None
+                gateway_platforms = {}
             elif gateway_running and remote_health_body is not None:
                 # The health probe confirmed the gateway is alive, but the local
                 # runtime status file may be stale (cross-container).  Override
