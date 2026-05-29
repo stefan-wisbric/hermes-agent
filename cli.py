@@ -15052,8 +15052,19 @@ def main(
             task_id=cli.session_id,
         )
         if missing_skills:
+            # Fail soft: an unknown skill must not abort the worker. A hard
+            # raise here turns a single bad skill reference (e.g. an agent
+            # attaching a global ~/.claude skill that is not provisioned to the
+            # worker profile) into a deterministic startup crash, which the
+            # dispatcher then re-promotes into an infinite crash loop. Skip the
+            # unknown skills with a loud warning and continue with whatever
+            # loaded successfully.
             missing_display = ", ".join(missing_skills)
-            raise ValueError(f"Unknown skill(s): {missing_display}")
+            logger.warning(
+                "Skipping unknown skill(s): %s — continuing without them. "
+                "Provision them to this worker profile if they are required.",
+                missing_display,
+            )
         if skills_prompt:
             cli.system_prompt = "\n\n".join(
                 part for part in (cli.system_prompt, skills_prompt) if part
