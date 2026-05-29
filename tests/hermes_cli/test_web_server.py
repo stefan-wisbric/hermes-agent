@@ -1244,6 +1244,76 @@ class TestWebServerEndpoints:
 
 
 
+        class _Platform:
+            def __init__(self, value):
+                self.value = value
+
+        class _GatewayConfig:
+            def get_connected_platforms(self):
+                return [_Platform("matrix")]
+
+        monkeypatch.setattr(
+            gateway_config, "load_gateway_config", lambda: _GatewayConfig()
+        )
+        monkeypatch.setenv("MATRIX_HOME_ROOM", "!room:matrix.org")
+
+        resp = self.client.get("/api/cron/delivery-targets")
+
+        assert resp.status_code == 200
+        targets = {t["id"]: t for t in resp.json()["targets"]}
+        # Local is always offered; matrix appears because its gateway is configured.
+        assert "local" in targets
+        assert "matrix" in targets
+        assert targets["matrix"]["home_target_set"] is True
+        # No hardcoded telegram/discord/slack/email when they aren't configured.
+        assert "telegram" not in targets
+
+    def test_get_status_ignores_stale_startup_failed_from_race_loser(self, monkeypatch):
+        import gateway.config as gateway_config
+        import hermes_cli.web_server as web_server
+
+        class _GatewayConfig:
+            def get_connected_platforms(self):
+                return []
+
+        monkeypatch.setattr(web_server, "get_running_pid", lambda: 87430)
+        monkeypatch.setattr(
+            web_server,
+            "read_runtime_status",
+            lambda: {
+                "pid": 87475,
+                "gateway_state": "startup_failed",
+                "exit_reason": "discord conflict",
+                "platforms": {
+                    "discord": {"state": "fatal", "error_message": "token already in use"},
+                },
+            },
+        )
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: _GatewayConfig())
+
+        resp = self.client.get("/api/status")
+
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["gateway_running"] is True
+        assert payload["gateway_state"] == "running"
+        assert payload["gateway_exit_reason"] is None
+        assert payload["gateway_platforms"] == {}
+
+    def test_get_config_schema(self):
+        resp = self.client.get("/api/config/schema")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "fields" in data
+        assert "category_order" in data
+        schema = data["fields"]
+        assert len(schema) > 100  # Should have 150+ fields
+        assert "model" in schema
+        # Verify category_order is a non-empty list
+        assert isinstance(data["category_order"], list)
+        assert len(data["category_order"]) > 0
+        assert "general" in data["category_order"]
 
     def _schema_provider_options(self, key):
         resp = self.client.get("/api/config/schema")

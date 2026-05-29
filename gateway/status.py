@@ -993,6 +993,15 @@ def write_runtime_status(
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
+    owner_record = _read_pid_record(_get_pid_path())
+    owner_pid = _pid_from_record(owner_record)
+    if owner_pid is not None and owner_pid != os.getpid() and _pid_exists(owner_pid):
+        owner_start = owner_record.get("start_time") if isinstance(owner_record, dict) else None
+        current_start = _get_process_start_time(owner_pid)
+        same_start = owner_start is None or current_start is None or owner_start == current_start
+        if same_start and (_looks_like_gateway_process(owner_pid) or _record_looks_like_gateway(owner_record or {})):
+            return
+
     payload = _read_json_file(path) or _build_runtime_status_record()
     previous_payload = copy.deepcopy(payload)
     current_record = _build_pid_record()
