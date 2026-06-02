@@ -7971,6 +7971,13 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    profile_unhealthy: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks skipped because the assignee profile's configured runtime
+    is currently unusable, as ``(task_id, reason)`` pairs.
+
+    The task remains in its original column and is not claimed, so it can
+    run automatically on a later tick after the operator fixes the profile
+    runtime (for example by running ``claude auth login --claudeai``)."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9524,6 +9531,210 @@ def review_dispatch_enabled() -> bool:
     except Exception:
         return True
 
+_CLAUDE_CLI_PROVIDER_ALIASES = frozenset({
+    "claude-cli",
+    "claude_cli",
+    "claude-code",
+    "claude-code-cli",
+    "anthropic-cli",
+})
+_CLAUDE_CLI_RUNTIME_ALIASES = frozenset({"cli", "claude_cli", "claude-cli"})
+_CLAUDE_CLI_LOGIN_MESSAGE = (
+    "Claude CLI is not logged in; run `claude auth login --claudeai`."
+)
+
+
+def _config_uses_claude_cli_runtime(config: Any) -> bool:
+    """Return True if a Hermes config routes model calls through Claude CLI."""
+    if not isinstance(config, dict):
+        return False
+    model_cfg = config.get("model")
+    if not isinstance(model_cfg, dict):
+        return False
+    provider = str(model_cfg.get("provider") or "").strip().lower()
+    if provider in _CLAUDE_CLI_PROVIDER_ALIASES:
+        return True
+    runtime = str(model_cfg.get("claude_runtime") or "").strip().lower()
+    return provider == "anthropic" and runtime in _CLAUDE_CLI_RUNTIME_ALIASES
+
+
+def _profile_config_uses_claude_cli_runtime(profile: str) -> bool:
+    """Best-effort check for whether ``profile`` is configured for Claude CLI."""
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile_home = Path(resolve_profile_env(normalize_profile_name(profile)))
+    except Exception:
+        return False
+
+    config_path = profile_home / "config.yaml"
+    if not config_path.is_file():
+        return False
+    try:
+        import yaml
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except Exception:
+        return False
+    return _config_uses_claude_cli_runtime(config)
+
+
+def _parse_claude_auth_status_json(output: str) -> Optional[dict[str, Any]]:
+    if not output.strip():
+        return None
+    try:
+        parsed = json.loads(output)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _short_cli_output(output: str, limit: int = 500) -> str:
+    compact = " ".join(line.strip() for line in output.splitlines() if line.strip())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "…"
+
+
+def _claude_cli_smoke_preflight(claude_bin: str) -> Optional[str]:
+    """Run a tiny Claude CLI inference to catch stale subscription tokens.
+
+    Opt-in (``HERMES_CLAUDE_CLI_PREFLIGHT_SMOKE=1``): the dispatcher ticks every
+    ~60s, so an always-on smoke test would burn a throwaway inference per
+    claude-cli profile per tick even when auth is healthy. The cheap
+    ``claude auth status`` check below already catches the common logged-out
+    case; enable this only when stale-but-logged-in subscription tokens are a
+    concern.
+    """
+    raw_enabled = os.getenv("HERMES_CLAUDE_CLI_PREFLIGHT_SMOKE", "0").strip().lower()
+    if raw_enabled not in {"1", "true", "yes", "on"}:
+        return None
+    raw_timeout = os.getenv("HERMES_CLAUDE_CLI_PREFLIGHT_TIMEOUT_SECONDS", "30")
+    try:
+        timeout = max(1, int(raw_timeout))
+    except ValueError:
+        timeout = 30
+    try:
+        result = subprocess.run(
+            [
+                claude_bin,
+                "-p",
+                "Reply exactly OK.",
+                "--no-session-persistence",
+                "--output-format",
+                "text",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return (
+            f"Claude CLI not found: {claude_bin}. "
+            "Install Claude Code or set HERMES_CLAUDE_CLI_BIN."
+        )
+    except subprocess.TimeoutExpired:
+        return f"Claude CLI inference smoke test timed out after {timeout}s."
+    except Exception as exc:
+        return f"Claude CLI inference smoke test failed: {exc}"
+
+    output = "\n".join(
+        part for part in ((result.stdout or "").strip(), (result.stderr or "").strip())
+        if part
+    ).strip()
+    if result.returncode == 0:
+        return None
+    lower = output.lower()
+    if (
+        "not logged" in lower
+        or "log in" in lower
+        or "login required" in lower
+        or "invalid authentication credentials" in lower
+        or "failed to authenticate" in lower
+    ):
+        return _CLAUDE_CLI_LOGIN_MESSAGE
+    detail = _short_cli_output(output) or f"claude exited {result.returncode}"
+    return f"Claude CLI inference smoke test failed: {detail}"
+
+
+def _claude_cli_auth_preflight() -> Optional[str]:
+    """Return an operator-facing reason if the local Claude CLI is unusable."""
+    claude_bin = os.getenv("HERMES_CLAUDE_CLI_BIN", "").strip() or "claude"
+    try:
+        result = subprocess.run(
+            [claude_bin, "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return (
+            f"Claude CLI not found: {claude_bin}. "
+            "Install Claude Code or set HERMES_CLAUDE_CLI_BIN."
+        )
+    except subprocess.TimeoutExpired:
+        return "Claude CLI auth check timed out after 5s."
+    except Exception as exc:
+        return f"Claude CLI auth check failed: {exc}"
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    combined = "\n".join(part for part in (stdout, stderr) if part).strip()
+
+    parsed = (
+        _parse_claude_auth_status_json(stdout)
+        or _parse_claude_auth_status_json(combined)
+    )
+    if parsed is not None:
+        if bool(parsed.get("loggedIn") or parsed.get("logged_in")):
+            return _claude_cli_smoke_preflight(claude_bin)
+        if "loggedIn" in parsed or "logged_in" in parsed:
+            return _CLAUDE_CLI_LOGIN_MESSAGE
+        detail = _short_cli_output(
+            str(parsed.get("error") or parsed.get("message") or combined)
+        )
+        if detail and detail != "{}":
+            lower_detail = detail.lower()
+            if "not logged" in lower_detail or "login" in lower_detail:
+                return _CLAUDE_CLI_LOGIN_MESSAGE
+            return f"Claude CLI auth check failed: {detail}"
+        return _CLAUDE_CLI_LOGIN_MESSAGE
+
+    lower = combined.lower()
+    if (
+        "not logged" in lower
+        or "log in" in lower
+        or "login required" in lower
+        or "invalid authentication credentials" in lower
+        or "failed to authenticate" in lower
+    ):
+        return _CLAUDE_CLI_LOGIN_MESSAGE
+    if result.returncode != 0:
+        detail = _short_cli_output(combined) or f"claude exited {result.returncode}"
+        return f"Claude CLI auth check failed: {detail}"
+    return _claude_cli_smoke_preflight(claude_bin)
+
+
+def _kanban_profile_runtime_preflight(
+    assignee: str,
+    cache: dict[str, Optional[str]],
+) -> Optional[str]:
+    """Return a runtime health problem for ``assignee``, cached per tick."""
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        profile = normalize_profile_name(assignee)
+    except Exception:
+        profile = str(assignee or "").strip().lower()
+    if profile in cache:
+        return cache[profile]
+    if not _profile_config_uses_claude_cli_runtime(profile):
+        cache[profile] = None
+        return None
+    cache[profile] = _claude_cli_auth_preflight()
+    return cache[profile]
+
 
 def dispatch_once(
     conn: sqlite3.Connection,
@@ -9749,6 +9960,9 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # Per-tick cache of profile runtime-health preflight results, shared by the
+    # ready and review loops so each claude-cli profile is probed at most once.
+    profile_preflight_cache: dict[str, Optional[str]] = {}
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -9851,6 +10065,20 @@ def _dispatch_once_locked(
                     _append_event(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
+                    )
+            continue
+        preflight_reason = _kanban_profile_runtime_preflight(
+            row_assignee, profile_preflight_cache
+        )
+        if preflight_reason is not None:
+            result.profile_unhealthy.append((row["id"], preflight_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        row["id"],
+                        "spawn_preflight_failed",
+                        {"assignee": row_assignee, "reason": preflight_reason},
                     )
             continue
         if dry_run:
@@ -9982,6 +10210,20 @@ def _dispatch_once_locked(
                     _append_event(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
+                    )
+            continue
+        preflight_reason = _kanban_profile_runtime_preflight(
+            row["assignee"], profile_preflight_cache
+        )
+        if preflight_reason is not None:
+            result.profile_unhealthy.append((row["id"], preflight_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        row["id"],
+                        "spawn_preflight_failed",
+                        {"assignee": row["assignee"], "reason": preflight_reason},
                     )
             continue
         if dry_run:
