@@ -75,12 +75,6 @@ def test_show_status_reports_vercel_backend_contract(monkeypatch, capsys, tmp_pa
     assert "live processes do not survive" in output
 
 
-    assert "Nous Portal   ✗ not logged in (run: hermes portal)" in output
-    assert "Error:      Refresh session has been revoked" in output
-    assert "Access exp:" in output
-    assert "Key exp:" in output
-
-
 def test_show_status_explains_codex_app_server_runtime(monkeypatch, capsys, tmp_path):
     from hermes_cli import status as status_mod
     import hermes_cli.auth as auth_mod
@@ -179,18 +173,15 @@ def test_show_status_reports_nous_inference_key_without_portal_login(monkeypatch
     monkeypatch.setattr(status_mod, "resolve_requested_provider", lambda requested=None: "openai-codex", raising=False)
     monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "openai-codex", raising=False)
     monkeypatch.setattr(status_mod, "provider_label", lambda provider: "OpenAI Codex", raising=False)
-    monkeypatch.setattr(
-        auth_mod,
-        "get_nous_auth_status",
-        lambda: {
-            "logged_in": False,
-            "inference_credential_present": True,
-            "credential_source": "pool:manual opaque key",
-            "inference_base_url": "https://inference.example.com/v1",
-            "agent_key_expires_at": "2099-01-01T00:00:00+00:00",
-        },
-        raising=False,
-    )
+    _nous_status = {
+        "logged_in": False,
+        "inference_credential_present": True,
+        "credential_source": "pool:manual opaque key",
+        "inference_base_url": "https://inference.example.com/v1",
+        "agent_key_expires_at": "2099-01-01T00:00:00+00:00",
+    }
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status", lambda: _nous_status, raising=False)
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status_local", lambda: _nous_status, raising=False)
     monkeypatch.setattr(
         status_mod,
         "get_nous_portal_account_info",

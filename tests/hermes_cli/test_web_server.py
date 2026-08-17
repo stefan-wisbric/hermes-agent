@@ -1238,11 +1238,8 @@ class TestWebServerEndpoints:
             "action_id": "b" * 32,
         }
 
-
-
-
-
-
+    def test_get_cron_delivery_targets_reflects_configured_gateways(self, monkeypatch):
+        import gateway.config as gateway_config
 
         class _Platform:
             def __init__(self, value):
@@ -1277,6 +1274,7 @@ class TestWebServerEndpoints:
                 return []
 
         monkeypatch.setattr(web_server, "get_running_pid", lambda: 87430)
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda *a, **k: 87430)
         monkeypatch.setattr(
             web_server,
             "read_runtime_status",

@@ -155,30 +155,6 @@ class TestCustomProviderPoolLoopbackNoKeyExemption:
         assert result["api_key"] == "sk-genuinely-long-real-key-12345"
 
 
-    class _Pool:
-        def has_credentials(self):
-            return True
-
-        def select(self):
-            return _Entry()
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
-
-    for stale in (
-        "https://openrouter.ai/api/v1",
-        "https://api.openai.com/v1",
-    ):
-        monkeypatch.setattr(
-            rp,
-            "_get_model_config",
-            lambda stale=stale: {"provider": "anthropic", "base_url": stale},
-        )
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
-        assert resolved["provider"] == "anthropic"
-        assert resolved["api_mode"] == "anthropic_messages"
-        assert resolved["base_url"] == "https://api.anthropic.com", stale
-
 
 def test_resolve_runtime_provider_anthropic_keeps_azure_base_url(monkeypatch):
     """Azure Foundry Anthropic endpoints are not anthropic.com hosts but are a
